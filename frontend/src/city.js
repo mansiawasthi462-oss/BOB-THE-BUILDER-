@@ -3,7 +3,7 @@ import { getArchetypeGeometries, pickArchetype } from './shapes.js';
 
 const MIN_H = 0.6;     // world height of a 1-line file
 const MAX_H = 28;      // world height of the biggest file ever
-const GROW_SPEED = 7;  // higher = snappier height transitions
+const GROW_SPEED = 15;  // higher = snappier height transitions
 // Buildings do not start rising the instant their file appears. They join a
 // queue and are released a few per second, so the city is always assembling
 // one building at a time no matter how many files a single commit added — an
@@ -12,37 +12,37 @@ const GROW_SPEED = 7;  // higher = snappier height transitions
 //
 // This paces the ANIMATION only. The data is untouched: every building still
 // carries the exact line count of its file at every commit.
-const BIRTH_RATE = 7;      // buildings released per second, baseline
-const BIRTH_CATCHUP = 4.0; // a backlog is cleared within roughly this long
+const BIRTH_RATE = 30;      // buildings released per second, baseline
+const BIRTH_CATCHUP = 1.5; // a backlog is cleared within roughly this long
 const HEAT_WINDOW = 5; // commits over which a "just changed" glow fades
-const EPS = 0.004;     // height delta below which we stop rewriting a matrix
+const EPS = 0.02;     // height delta below which we stop rewriting a matrix
 
 // One shared unit box for every building. All buildings live in a single
 // InstancedMesh, so a 10k-file repo costs ONE draw call instead of 10k.
 const UNIT = new THREE.BoxGeometry(1, 1, 1);
 
-// Warm amber rather than a hot orange: against pale model-white walls a
-// saturated heat colour reads as "this building is red", not "this file
-// changed recently".
-const HEAT_COLOR = new THREE.Color(0xffa257);
-const HOVER_COLOR = new THREE.Color(0xffffff);
+// Soft daylight tints keep interaction states visible without overpowering
+// Cheoma's own timber, plaster, and roof colors.
+const SELECT_COLOR = new THREE.Color(0xf1cf91); // soft amber
+const HEAT_COLOR = new THREE.Color(0xc0d9b5);   // muted leaf green
+const HOVER_COLOR = new THREE.Color(0xb4d7d4);  // pale celadon
+const MUTED_COLOR = new THREE.Color(0xc2beb2);  // softened warm stone
 
 /**
- * Material that renders like an urban plan: a crisp darker outline traced
- * around every face, and a lighter cap on roofs so the extrusions read as
- * footprints rather than raw boxes. Works with instancing because the effect
- * is derived from the box's own UVs and object-space normal, not per-object
- * geometry — so we keep the single-draw-call win.
+ * Cheoma's vertex colors supply the building materials. Instance colors are
+ * reserved for gentle selection, activity, hover, and filtered-state tints.
  */
 const FLOOR_H = 0.8;  // world units per storey
 const BAY_W = 0.52;   // world units per structural bay (pilaster + glazing)
 
 function planMaterial({
-  edge = 0.45, edgeWidth = 1.9, roofLift = 0.0, windows = false, shapes = false, ...opts
+  mode = 'building', edgeWidth = 1.0, shapes = false, ...opts
 } = {}) {
+  const building = mode === 'building';
   const mat = new THREE.MeshStandardMaterial({
     color: 0xffffff, // modulated per-instance via instanceColor
-    roughness: 0.82,
+    vertexColors: true, // Cheoma's plaster, timber and tile colors per source mesh
+    roughness: 0.78,
     metalness: 0.0,
     ...opts,
   });
@@ -89,65 +89,30 @@ function planMaterial({
         vWorld = (modelMatrix * _wp).xyz;`
       );
 
-    const facade = windows ? `
-          // ---- Facade -------------------------------------------------
-          // Modelled as structural BAYS, not a grid of dots: a pale pilaster
-          // strip, a recessed glazed strip between each pair, and a floor
-          // slab line at every storey. That vertical rhythm is what makes an
-          // extrusion read as architecture rather than a patterned box.
-          //
-          // Both rhythms are measured in WORLD units, not UVs, so every
-          // building shares one storey height and one bay width — a tall file
-          // reads as a tower, a short one as a shed, and nothing stretches.
-          // Anchoring to world Y also means the facade stays put as a
-          // building grows on the timeline; new storeys stack on top.
-          float side = 1.0 - step(0.9, abs(vObjN.y));
-          float h = max(vScale.y, 1e-4);
+    const surface = building ? `
+          // Cheoma's material colors are baked into the vertex colors. Keep
+          // those values intact so its timber, plaster and tiled roofs read
+          // like the source examples instead of office facades.
+          gGlass = 0.0;
+    ` : `
+          // ---- District plate ---------------------------------------------
+          // Dark ground zone; its tint arrives via the instance colour.
+    `;
 
-          // Which horizontal extent this face spans depends on its normal, and
-          // on how wide this particular wing is — otherwise a narrow wing
-          // crams a whole building's bays into half the width.
-          float faceW = mix(vScale.x, vScale.z, step(0.5, abs(vObjN.x))) * vWidthFrac;
-
-          float bx = fract(vUv.x * faceW / ${BAY_W.toFixed(2)});
-          float fy = fract((vWorld.y - 0.30) / ${FLOOR_H.toFixed(2)});
-
-          float bw = fwidth(bx) * 1.5 + 0.02;
-          float fw = fwidth(fy) * 1.5 + 0.03;
-
-          // Glazing occupies the middle of each bay; the rest is pilaster.
-          float bay = smoothstep(0.28 - bw, 0.28 + bw, bx)
-                    * (1.0 - smoothstep(0.84 - bw, 0.84 + bw, bx));
-          // Floor slab runs across the top of every storey, breaking the
-          // glazing into panels.
-          float slab = smoothstep(0.80 - fw, 0.80 + fw, fy);
-
-          float glass = bay * (1.0 - slab) * side;
-
-          // Solid plinth at street level, parapet on top, and no facade at all
-          // on anything too short to have storeys.
-          glass *= smoothstep(0.18, 0.5, vWorld.y);
-          glass *= 1.0 - smoothstep(h - 0.34, h - 0.10, vWorld.y);
-          glass *= smoothstep(0.7, 1.5, h);
-          gGlass = glass;
-
-          // Glazing reads darker and cooler than the pale wall around it.
-          vec3 glassCol = mix(diffuseColor.rgb * 0.55, vec3(0.30, 0.36, 0.44), 0.55);
-          diffuseColor.rgb = mix(diffuseColor.rgb, glassCol, glass * 0.80);
-
-          // Real walls have thickness, so glazing sits in a reveal. Shade the
-          // head and one jamb of each opening to imply that depth — without
-          // it the window is a decal on a flat plane, which is the single
-          // biggest tell that a building is fake.
-          float head = smoothstep(0.80, 0.62, fy);          // under the lintel
-          float jamb = smoothstep(0.28, 0.40, bx);          // beside the pier
-          float reveal = glass * (1.0 - head * 0.55) * (1.0 - (1.0 - jamb) * 0.35);
-          diffuseColor.rgb *= 1.0 - (glass - reveal) * 0.62;
-
-          // A whisper of shading on the pilasters keeps them from going flat.
-          float pil = (1.0 - bay) * side * smoothstep(0.18, 0.5, vWorld.y);
-          diffuseColor.rgb *= 1.0 - pil * 0.05;
-    ` : '';
+    const edges = building ? `
+          // Chamfered edges: perfectly sharp corners read as CG. One side of
+          // every border catches light, the other falls into shade.
+          float lit2 = min(dl, dt);
+          float shd  = min(dr, db);
+          float facing = step(lit2, shd);
+          vec3 catchLight = diffuseColor.rgb + vec3(0.025, 0.025, 0.03);
+          diffuseColor.rgb = mix(diffuseColor.rgb,
+                                 mix(diffuseColor.rgb * 0.82, catchLight, facing), e);
+    ` : `
+          // A thin lighter border around each zone, the way the UI separates
+          // surfaces with 1px outlines rather than shadows.
+          diffuseColor.rgb = mix(diffuseColor.rgb, diffuseColor.rgb * 1.14 + vec3(0.018), e * 0.72);
+    `;
 
     shader.fragmentShader = shader.fragmentShader
       .replace(
@@ -161,55 +126,37 @@ function planMaterial({
         // the roughness/metalness stage further along the shader.
         float gGlass;`
       )
-      // Glass and masonry are different materials, not just different colours.
-      // Giving the glazing a low roughness and a little metalness lets it pick
-      // up the environment probe, which is what stops a facade reading as a
-      // painted-on pattern.
+      // Glazing is glass, not paint: smooth and slightly metallic so it
+      // catches the environment probe.
       .replace(
         '#include <roughnessmap_fragment>',
         `#include <roughnessmap_fragment>
-        roughnessFactor = mix(roughnessFactor, 0.14, gGlass);`
+        roughnessFactor = mix(roughnessFactor, 0.16, gGlass);`
       )
       .replace(
         '#include <metalnessmap_fragment>',
         `#include <metalnessmap_fragment>
-        metalnessFactor = mix(metalnessFactor, 0.62, gGlass);`
+        metalnessFactor = mix(metalnessFactor, 0.55, gGlass);`
       )
       .replace(
         '#include <color_fragment>',
         `#include <color_fragment>
         {
-          ${facade}
+          gGlass = 0.0;
+          ${surface}
 
-          // Perfectly sharp corners are a realism tell — real edges carry a
-          // small chamfer that catches light on one side and shade on the
-          // other. Rather than adding bevel geometry to every instance, the
-          // top/left borders are lifted and the bottom/right darkened, which
-          // reads as a chamfer from any angle and costs nothing.
           float dl = vUv.x, dr = 1.0 - vUv.x;
           float db = vUv.y, dt = 1.0 - vUv.y;
           float d  = min(min(dl, dr), min(db, dt));
-          // fwidth keeps the chamfer a constant thickness on screen.
+          // fwidth keeps edges a constant thickness on screen at any zoom.
           float w  = fwidth(d) * ${edgeWidth.toFixed(2)};
           float e  = 1.0 - smoothstep(0.0, max(w, 1e-5), d);
-          // Which border is nearest decides whether this edge is lit or shaded.
-          float lit = min(dl, dt);
-          float shd = min(dr, db);
-          float facing = step(lit, shd);
-          diffuseColor.rgb = mix(
-            diffuseColor.rgb,
-            diffuseColor.rgb * mix(${(1.0 - edge).toFixed(3)}, ${(1.0 + edge * 0.55).toFixed(3)}, facing),
-            e
-          );
-
-          // Roofs (object-space +Y) get a lighter cap.
-          float roof = step(0.9, vObjN.y);
-          diffuseColor.rgb = mix(diffuseColor.rgb, diffuseColor.rgb + ${roofLift.toFixed(3)}, roof);
+          ${edges}
         }`
       );
   };
-  // Distinct key so three doesn't share a cached program with a different variant.
-  mat.customProgramCacheKey = () => `plan-${edge}-${edgeWidth}-${roofLift}-${windows}-${shapes}`;
+  // Distinct key so three doesn't share a cached program with another variant.
+  mat.customProgramCacheKey = () => `daylight-${mode}-${edgeWidth}-${shapes}`;
   return mat;
 }
 
@@ -236,6 +183,9 @@ export class City {
     this.data = data;
     this.t = 0;
     this.hovered = null;
+    this.selected = null;
+    this.heatOn = true;
+    this.itemByPath = new Map();
     this.birthQueue = [];
     this._birthCredit = 0;
 
@@ -271,7 +221,7 @@ export class City {
       if (!buckets[a].length) return null;
       const mesh = new THREE.InstancedMesh(
         geo,
-        planMaterial({ edge: 0.45, roofLift: 0.12, windows: true, shapes: true }),
+        planMaterial({ mode: 'building', shapes: true }),
         buckets[a].length
       );
       mesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
@@ -290,27 +240,16 @@ export class City {
       buckets[a].forEach((i, gi) => {
         const b = list[i];
 
-        // Buildings are finished like an architectural scale model: pale,
-        // near-white masonry that lets the massing and the facade rhythm do
-        // the talking. The language hue survives only as a faint tint — the
-        // saturated version of GitHub's palette glares at city scale and
-        // flattens everything around it, and the district plates underneath
-        // already carry the colour coding. Hue and lightness are nudged per
-        // file so neighbours of one language stay individually readable.
-        const base = new THREE.Color(b.color);
-        base.getHSL(hsl);
-        const j = hash(b.path);
-        base.setHSL(
-          (hsl.h + (j - 0.5) * 0.05 + 1) % 1,
-          Math.min(0.20, hsl.s * 0.26),
-          clamp(0.80 + (j - 0.5) * 0.14, 0.70, 0.90)
-        );
+        // Preserve Cheoma's baked surface colors; instance tint is reserved
+        // for selection, activity and language filtering states.
+        const base = new THREE.Color(0xffffff);
 
         const item = {
           b, base, h: 0, targetH: 0, heat: 0, loc: 0, dirty: true, g: a, gi,
           queued: false,
         };
         this.items[i] = item;
+        this.itemByPath.set(b.path, item);
         g.items[gi] = item;
         g.mesh.setColorAt(gi, base);
         this._writeMatrix(item, 0);
@@ -371,7 +310,7 @@ export class City {
 
     const plates = new THREE.InstancedMesh(
       UNIT,
-      planMaterial({ edge: 0.3, edgeWidth: 1.4, roofLift: 0.0 }),
+      planMaterial({ mode: 'plate', edgeWidth: 0.9, roughness: 0.95 }),
       sorted.length
     );
     plates.receiveShadow = true;
@@ -392,10 +331,14 @@ export class City {
       m.setPosition(d.x, y, d.z);
       plates.setMatrixAt(i, m);
 
-      // One hue per folder, strong enough to zone the map but kept below the
-      // buildings in lightness so the extrusions still read on top of it.
+      // Keep the districts in a shared stone-and-sage range so the colored
+      // roof and facade details remain the focus of the daylight palette.
       const j = hash(d.path || d.name || String(i));
-      const c = new THREE.Color().setHSL(j, 0.5, 0.6 - Math.min(d.depth, 3) * 0.05);
+      const c = new THREE.Color().setHSL(
+        0.18 + (j - 0.5) * 0.05,
+        0.16,
+        0.35 - Math.min(d.depth, 3) * 0.03
+      );
       this.plateBase[i] = c;
       plates.setColorAt(i, c);
       indexByPath.set(d.path, i);
@@ -432,14 +375,14 @@ export class City {
   _refreshPlates() {
     if (!this.plates) return;
     let dirty = false;
-    const dim = new THREE.Color(0x9aa1ac);
+    const dim = new THREE.Color(0x746e62);
     const c = new THREE.Color();
     for (let i = 0; i < this.plateLive.length; i++) {
       const live = this.plateLive[i] > 0 ? 1 : 0;
       if (this.plateWasLive[i] === live) continue;
       this.plateWasLive[i] = live;
       c.copy(this.plateBase[i]);
-      if (!live) c.lerp(dim, 0.72);
+      if (!live) c.lerp(dim, 0.75);
       this.plates.setColorAt(i, c);
       dirty = true;
     }
@@ -472,7 +415,7 @@ export class City {
         x.targetH = target;
         x.dirty = true;
       }
-      const heat = loc > 0 && c >= 0 ? Math.max(0, 1 - (t - c) / HEAT_WINDOW) : 0;
+      const heat = this.heatOn && loc > 0 && c >= 0 ? Math.max(0, 1 - (t - c) / HEAT_WINDOW) : 0;
       if (heat !== x.heat) { x.heat = heat; x.colorDirty = true; }
       if (loc > 0) {
         alive++;
@@ -500,6 +443,79 @@ export class City {
     let n = 0;
     for (let i = 0; i < this.n; i++) if (locAt(this.items[i].b.history, t).loc > 0) n++;
     return n;
+  }
+
+  /** Select a building (by its data record or path), or clear with null. */
+  select(target) {
+    const b = typeof target === 'string' ? { path: target } : target;
+    const next = b ? this.itemByPath.get(b.path) || null : null;
+    if (next === this.selected) return next;
+    if (this.selected) this.selected.colorDirty = true;
+    this.selected = next;
+    if (next) next.colorDirty = true;
+    return next;
+  }
+
+  /**
+   * Show only the given languages; everything else drops to grey. Pass null
+   * to show everything. Filtering never hides a building — the city keeps its
+   * shape, so you can still see where the filtered-out code sits.
+   */
+  setLanguageFilter(langs) {
+    const keep = langs && langs.size ? langs : null;
+    for (const x of this.items) {
+      const muted = keep ? !keep.has(x.b.lang) : false;
+      if (muted !== !!x.muted) { x.muted = muted; x.colorDirty = true; }
+    }
+  }
+
+  /** Turn the emerald "just changed" glow on or off. */
+  setHeat(on) {
+    this.heatOn = !!on;
+    if (this.t != null) this.setCommit(this.t);
+  }
+
+  /**
+   * One label per top-level folder (falling back to the next level down when
+   * the repo has a single root folder), placed on the zone's front edge.
+   */
+  districtLabels() {
+    const ds = this.districts || [];
+    let pick = ds.filter((d) => d.depth === 1);
+    if (pick.length <= 1) {
+      const deeper = ds.filter((d) => d.depth === 2);
+      if (deeper.length > 1) pick = deeper;
+    }
+    return pick.map((d) => {
+      const c = new THREE.Color().setHSL(hash(d.path || d.name || ''), 0.55, 0.62);
+      return {
+        text: d.name || d.path.split('/').pop(),
+        x: d.x, y: 0.5, z: d.z + d.d / 2,
+        color: `#${c.getHexString()}`,
+      };
+    });
+  }
+
+  /** Centre and footprint of the zone holding the most code — "downtown". */
+  core() {
+    const ds = (this.districts || []).filter((d) => d.depth === 1);
+    if (!ds.length) return { x: 0, z: 0, size: this.radius };
+    const weight = new Map();
+    for (const x of this.items) {
+      const top = x.b.path.includes('/') ? x.b.path.split('/')[0] : null;
+      if (top) weight.set(top, (weight.get(top) || 0) + x.b.maxLoc);
+    }
+    const best = ds.reduce((a, d) => ((weight.get(d.path) || 0) > (weight.get(a.path) || 0) ? d : a), ds[0]);
+    return { x: best.x, z: best.z, size: Math.max(best.w, best.d) };
+  }
+
+  /** World-space top-centre of a building as it stands now, for camera focus. */
+  anchorOf(building) {
+    const x = this.itemByPath.get(building.path);
+    if (!x) return null;
+    const { plot } = x.b;
+    return { x: plot.x, y: Math.max(x.h, this.heightForLoc(x.b.maxLoc) * 0.5), z: plot.z,
+      size: Math.max(plot.w, plot.d) };
   }
 
   /** `item` is the record handed back by the hit resolver, or -1 / null. */
@@ -549,6 +565,9 @@ export class City {
     this._releaseBirths(dt);
     const k = Math.min(1, dt * GROW_SPEED);
 
+    let anyMatrixDirty = false;
+    let anyColorDirty = false;
+
     for (let i = 0; i < this.n; i++) {
       const x = this.items[i];
       const g = this.groups[x.g];
@@ -560,24 +579,40 @@ export class City {
         if (Math.abs(x.targetH - x.h) <= EPS) { x.h = x.targetH; x.dirty = false; }
         this._writeMatrix(x, x.h);
         g.matrixDirty = true;
+        anyMatrixDirty = true;
       }
 
       if (x.colorDirty) {
-        this._c.copy(x.base);
-        if (x.heat > 0.01) this._c.lerp(HEAT_COLOR, Math.min(0.5, x.heat * 0.55));
-        if (x === this.hovered) this._c.lerp(HOVER_COLOR, 0.6);
+        if (x === this.selected) {
+          this._c.copy(SELECT_COLOR);
+        } else if (x.muted) {
+          this._c.copy(MUTED_COLOR);
+        } else {
+          this._c.copy(x.base);
+          if (x.heat > 0.01) this._c.lerp(HEAT_COLOR, Math.min(0.75, x.heat * 0.8));
+        }
+        if (x === this.hovered) this._c.lerp(HOVER_COLOR, x.muted ? 0.15 : 0.35);
         g.mesh.setColorAt(x.gi, this._c);
         x.colorDirty = false;
         g.colorDirty = true;
+        anyColorDirty = true;
       }
     }
 
-    for (const g of this.groups) {
-      if (!g) continue;
-      if (g.matrixDirty) { g.mesh.instanceMatrix.needsUpdate = true; g.matrixDirty = false; }
-      if (g.colorDirty && g.mesh.instanceColor) {
-        g.mesh.instanceColor.needsUpdate = true;
-        g.colorDirty = false;
+    // Only update GPU if something actually changed
+    if (anyMatrixDirty) {
+      for (const g of this.groups) {
+        if (!g) continue;
+        if (g.matrixDirty) { g.mesh.instanceMatrix.needsUpdate = true; g.matrixDirty = false; }
+      }
+    }
+    if (anyColorDirty) {
+      for (const g of this.groups) {
+        if (!g) continue;
+        if (g.colorDirty && g.mesh.instanceColor) {
+          g.mesh.instanceColor.needsUpdate = true;
+          g.colorDirty = false;
+        }
       }
     }
   }
@@ -592,6 +627,8 @@ export class City {
     this.scene.setHoverTargets([]);
     this.scene.hitResolver = null;
     this.hovered = null;
+    this.selected = null;
+    this.itemByPath.clear();
     for (const g of this.groups || []) {
       if (!g) continue;
       this.scene.cityGroup.remove(g.mesh);
@@ -611,7 +648,7 @@ export class City {
 }
 
 /** Binary search: last history point with c <= t. */
-function locAt(history, t) {
+export function locAt(history, t) {
   if (!history.length || t < history[0].c) return { loc: 0, c: -1 };
   let lo = 0, hi = history.length - 1, ans = 0;
   while (lo <= hi) {
@@ -621,3 +658,4 @@ function locAt(history, t) {
   }
   return { loc: history[ans].loc, c: history[ans].c };
 }
+
